@@ -1,0 +1,42 @@
+# xiaoair + OwnTone 联合部署
+#
+# 架构:
+#   小爱音箱(收音) -> xiaoair(指令解析) -> OwnTone -> AirPlay -> 你的音箱
+#
+# 使用前:
+#   1. 修改 ./music 为你的音乐目录(下面 volumes 里)
+#   2. owntone 必须 host 网络(否则 mDNS 发现不了 AirPlay 音箱)
+#   3. 启动后访问 http://<主机IP>:8091 完成小米登录和音箱选择
+
+services:
+  owntone:
+    image: linuxserver/daapd:28.10-ls175
+    container_name: owntone
+    network_mode: host          # 必须 host: AirPlay 设备靠 mDNS 发现
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./owntone:/config
+      # 改成你的音乐库实际路径
+      - /path/to/your/music:/music:ro
+
+  xiaoair:
+    image: ghcr.io/cnstark/xiaoair:latest
+    build: .
+    container_name: xiaoair
+    restart: unless-stopped
+    ports:
+      - "8091:8091"             # 设置页面
+    environment:
+      - DATA_DIR=/data
+      - OT_URL=http://192.168.1.2:3689   # 改成主机 IP(owntone 为 host 网络, 3689 在主机上)
+      - OT_USER=admin
+      - OT_PASS=changeme
+      - TRIGGER=影院
+    volumes:
+      - ./data:/data
+    depends_on:
+      - owntone

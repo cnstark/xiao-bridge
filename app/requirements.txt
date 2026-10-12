@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+aiohttp
+python-multipart
+miservice-fork
+rapidfuzz
