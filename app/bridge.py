@@ -571,8 +571,14 @@ def _norm(s):
     return re.sub(r"[\s,，。.!！?？、·'\"\"''\-_（）()《》的]", "", s or "")
 
 
+def _artist_names(artist):
+    """将合唱歌曲的歌手字段拆成可单独点名的歌手。"""
+    return [_norm(name) for name in re.split(r"[,，、;/；/&]+", artist or "")
+            if _norm(name)]
+
+
 async def ot_fuzzy_track(query, threshold=75):
-    """模糊匹配曲库, 返回最佳曲目或 None"""
+    """优先匹配指定歌手和歌名，再匹配单独的歌名。"""
     tracks = await ot_library_tracks()
     if not tracks:
         return None
@@ -580,19 +586,36 @@ async def ot_fuzzy_track(query, threshold=75):
     q = _norm(query)
     if not q:
         return None
-    best, best_score = None, 0.0
+    best_qualified, qualified_rank = None, (0.0, False, 0)
+    best_title, title_score = None, 0.0
     for t in tracks:
         title = _norm(t.get("title") or t.get("name") or "")
-        artist = _norm(t.get("artist", ""))
         if not title:
             continue
-        score = max(
-            fuzz.partial_ratio(q, title),
-            fuzz.ratio(q, title),
-            fuzz.ratio(q, artist + title) if artist else 0,
-        )
-        if score > best_score:
-            best, best_score = t, score
+        artists = _artist_names(t.get("artist", ""))
+        for artist in artists:
+            if artist not in q or len(q) <= len(artist):
+                continue
+            song_query = q.replace(artist, "", 1)
+            song_query = re.sub(r"^(?:演唱|唱|歌曲|歌|版本)+", "", song_query)
+            score = fuzz.ratio(song_query, title)
+            if len(song_query) <= len(title):
+                score = max(score, fuzz.partial_ratio(song_query, title))
+            rank = (score, song_query == title, len(artist))
+            if score >= threshold and rank > qualified_rank:
+                best_qualified, qualified_rank = t, rank
+
+        # 多出的内容可能是未识别出的歌手；不能仅凭歌名选择其他人的版本。
+        score = 0.0
+        if len(q) <= len(title) or (len(q) == len(title) + 1 and title not in q):
+            score = fuzz.ratio(q, title)
+            if len(q) <= len(title):
+                score = max(score, fuzz.partial_ratio(q, title))
+        if score > title_score:
+            best_title, title_score = t, score
+
+    best = best_qualified or best_title
+    best_score = qualified_rank[0] if best_qualified else title_score
     if best and best_score >= threshold:
         log.info("模糊匹配: %s -> %s - %s (%.0f)", query,
                  best.get("artist"), best.get("title") or best.get("name"), best_score)
