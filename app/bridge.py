@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import time
 from contextlib import asynccontextmanager
@@ -479,14 +480,7 @@ async def ot_play_search(query):
     # 首选: 曲库模糊匹配(容错语音识别误差)
     track = await ot_fuzzy_track(query)
     if track:
-        ok = await ot_post("/api/queue/items/add", params={
-            "uris": track["uri"], "clear": "true", "playback": "start",
-            "playback_from_position": 0,
-        })
-        if ok:
-            await ot_select_output()
-            return f"正在播放 {track.get('artist', '')} {track.get('title', '')}".strip()
-        return "播放失败"
+        return await ot_play_track_with_library(track)
     # 单曲没匹配到, 试试歌单(OwnTone 原生搜索)
     data = await ot_get("/api/search", params={
         "type": "playlist", "query": query, "media_kind": "music",
@@ -508,6 +502,41 @@ async def ot_play_search(query):
 TRACKS_CACHE = {"time": 0.0, "items": []}
 
 
+async def ot_play_track_with_library(track):
+    """先播放点播歌曲，再将曲库其余歌曲随机加入当前队列。"""
+    selected_uri = track.get("uri")
+    if not selected_uri:
+        return "播放失败"
+    tracks = await ot_library_tracks()
+    remaining = []
+    seen = {selected_uri}
+    for item in tracks:
+        uri = item.get("uri")
+        if uri and uri not in seen:
+            remaining.append(uri)
+            seen.add(uri)
+    random.shuffle(remaining)
+    uris = [selected_uri, *remaining]
+    title = track.get("title") or track.get("name") or ""
+    reply = f"正在播放 {track.get('artist', '')} {title}".strip()
+
+    # OwnTone 的 uris 是逗号分隔的查询参数，分批避免超长 URL。
+    for offset in range(0, len(uris), 50):
+        params = {"uris": ",".join(uris[offset:offset + 50])}
+        if offset == 0:
+            params.update({"clear": "true", "playback": "start",
+                           "playback_from_position": 0})
+        if not await ot_post("/api/queue/items/add", params=params):
+            if offset == 0:
+                return "播放失败"
+            log.warning("播放列表仅加入 %d/%d 首", offset, len(uris))
+            return reply + "，播放列表未全部加入"
+        if offset == 0:
+            await ot_select_output()
+    log.info("播放列表已随机加入 %d 首歌曲", len(uris))
+    return reply
+
+
 async def ot_library_tracks(force=False):
     """拉取全部曲目并缓存 5 分钟"""
     if not force and TRACKS_CACHE["items"] and time.time() - TRACKS_CACHE["time"] < 300:
@@ -520,19 +549,22 @@ async def ot_library_tracks(force=False):
             "limit": 500, "offset": offset,
         })
         if not data:
-            break
+            log.warning("曲库读取在第 %d 首中断", offset)
+            return []
         tracks = data.get("tracks", {})
         batch = tracks.get("items", [])
         items.extend(batch)
         total = tracks.get("total", 0)
         offset += len(batch)
+        if not batch and offset < total:
+            log.warning("曲库读取提前结束: %d/%d 首", offset, total)
+            return []
         if not batch or offset >= total:
             break
-    if items:
-        TRACKS_CACHE["items"] = items
-        TRACKS_CACHE["time"] = time.time()
-        log.info("曲库缓存: %d 首", len(items))
-    return TRACKS_CACHE["items"]
+    TRACKS_CACHE["items"] = items
+    TRACKS_CACHE["time"] = time.time()
+    log.info("曲库缓存: %d 首", len(items))
+    return items
 
 
 def _norm(s):
