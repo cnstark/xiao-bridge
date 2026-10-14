@@ -26,10 +26,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Docker Hub 登录(需要先在仓库 Settings → Secrets 里配置)
+      - uses: docker/login-action@v3
+        if: ${{ vars.DOCKERHUB_USERNAME != '' }}
+        with:
+          registry: docker.io
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: |
+            ghcr.io/${{ github.repository }}
+            ${{ vars.DOCKERHUB_USERNAME != '' && format('docker.io/{0}/xiaoair', vars.DOCKERHUB_USERNAME) || '' }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
