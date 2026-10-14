@@ -30,6 +30,8 @@ from miservice import MiAccount, MiNAService
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 TOKEN_PATH = os.path.join(DATA_DIR, "mi_token.json")
+HISTORY_PATH = os.path.join(DATA_DIR, "command_history.json")
+HISTORY_LIMIT = 100
 LATEST_ASK_API = (
     "https://userprofile.mina.mi.com/device_profile/v2/conversation"
     "?source=dialogu&hardware={hardware}&timestamp={ts}&limit=2"
@@ -77,6 +79,44 @@ def save_config(cfg):
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def load_history():
+    try:
+        with open(HISTORY_PATH, encoding="utf-8") as f:
+            history = json.load(f)
+        if not isinstance(history, list):
+            raise ValueError("历史文件格式错误")
+        return history[:HISTORY_LIMIT]
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        log.warning("读取指令历史失败: %s", e)
+        return []
+
+
+COMMAND_HISTORY = load_history()
+
+
+def record_command(query, matched, action, result, success):
+    entry = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "query": query,
+        "matched": matched,
+        "action": action,
+        "result": result,
+        "success": success,
+    }
+    COMMAND_HISTORY.insert(0, entry)
+    del COMMAND_HISTORY[HISTORY_LIMIT:]
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp_path = HISTORY_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(COMMAND_HISTORY, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, HISTORY_PATH)
+    except OSError as e:
+        log.error("保存指令历史失败: %s", e)
 
 
 STATE = {
@@ -496,8 +536,9 @@ async def ot_play_search(query):
             "uris": p["uri"], "clear": "true", "playback": "start",
         })
         if ok:
-            await ot_select_output()
-            return f"正在播放歌单 {p.get('name', '')}"
+            if await ot_select_output():
+                return f"正在播放歌单 {p.get('name', '')}"
+            return "输出音箱选择失败"
         return "播放失败"
     return f"没找到 {query}"
 
@@ -558,7 +599,8 @@ async def ot_play_track_with_library(track, tracks=None, reply=None):
             log.warning("播放列表仅加入 %d/%d 首", offset, len(uris))
             return reply + "，播放列表未全部加入"
         if offset == 0:
-            await ot_select_output()
+            if not await ot_select_output():
+                return "输出音箱选择失败"
     log.info("播放列表已随机加入 %d 首歌曲", len(uris))
     return reply
 
@@ -659,17 +701,16 @@ async def ot_action(action, arg=None):
         "stop": "/api/player/stop",
     }
     if action == "volume_set":
-        await ot_put("/api/player/volume", params={"volume": int(arg)})
-        return
-    await ot_put(mapping[action])
+        return await ot_put("/api/player/volume", params={"volume": int(arg)})
+    return await ot_put(mapping[action])
 
 
 async def ot_volume_delta(delta):
     data = await ot_get("/api/player")
-    cur = 50
-    if data:
-        cur = data.get("volume", 50)
-    await ot_action("volume_set", min(100, max(0, cur + delta)))
+    if not data:
+        return False
+    cur = data.get("volume", 50)
+    return await ot_action("volume_set", min(100, max(0, cur + delta)))
 
 
 # ---------------- 指令解析 ----------------
@@ -696,56 +737,79 @@ async def handle_command(query):
     cfg = STATE["config"]
     trig = cfg["trigger"]
     if not query.startswith(trig):
+        record_command(query, False, "未命中", "-", None)
         return False
     rest = query[len(trig):].strip("，。,. ")
     log.info("命中指令: %s -> %s", query, rest)
     STATE["last_command"] = f"{time.strftime('%H:%M:%S')} {query}"
 
     reply = "好的"
+    action = "点歌"
+    success = True
     try:
         m = re.match(r"^(?:播放|放|来一首|来首|我想听|我要听)(.+)$", rest)
         if m:
             reply = await ot_play_search(m.group(1).strip())
         elif rest in ("下一首", "下首歌", "切歌"):
-            await ot_action("next")
-            reply = "下一首"
+            action = "下一首"
+            success = await ot_action("next")
+            reply = "下一首" if success else "切歌失败"
         elif rest in ("上一首", "上首歌"):
-            await ot_action("previous")
-            reply = "上一首"
+            action = "上一首"
+            success = await ot_action("previous")
+            reply = "上一首" if success else "切歌失败"
         elif rest in ("暂停", "暂停播放"):
-            await ot_action("pause")
-            reply = "已暂停"
+            action = "暂停"
+            success = await ot_action("pause")
+            reply = "已暂停" if success else "暂停失败"
         elif rest in ("继续", "继续播放"):
-            await ot_action("play")
-            reply = "继续播放"
+            action = "继续播放"
+            success = await ot_action("play")
+            reply = "继续播放" if success else "继续播放失败"
         elif rest in ("停止", "停止播放", "关机"):
-            await ot_action("stop")
-            reply = "已停止"
+            action = "停止"
+            success = await ot_action("stop")
+            reply = "已停止" if success else "停止失败"
         elif rest in ("刷新列表", "刷新曲库", "更新曲库"):
-            await ot_put("/api/update")
-            tracks = await ot_library_tracks(force=True)
-            reply = f"曲库已刷新, 共 {len(tracks)} 首"
+            action = "刷新曲库"
+            success = await ot_put("/api/update")
+            if success:
+                tracks = await ot_library_tracks(force=True)
+                reply = f"曲库已刷新, 共 {len(tracks)} 首"
+            else:
+                reply = "刷新曲库失败"
         elif rest in ("音量大一点", "大点声", "声音大一点"):
-            await ot_volume_delta(+10)
-            reply = "音量加大"
+            action = "音量加大"
+            success = await ot_volume_delta(+10)
+            reply = "音量加大" if success else "调节音量失败"
         elif rest in ("音量小一点", "小点声", "声音小一点"):
-            await ot_volume_delta(-10)
-            reply = "音量减小"
+            action = "音量减小"
+            success = await ot_volume_delta(-10)
+            reply = "音量减小" if success else "调节音量失败"
         else:
             m2 = re.match(r"^音量(?:调到)?([0-9零一二两三四五六七八九十百]+)$", rest)
             if m2:
+                action = "设置音量"
                 vol = cn_to_int(m2.group(1))
                 if vol is not None:
-                    await ot_action("volume_set", min(100, max(0, vol)))
-                    reply = f"音量调到 {vol}"
+                    success = await ot_action("volume_set", min(100, max(0, vol)))
+                    reply = f"音量调到 {vol}" if success else "调节音量失败"
                 else:
-                    return True
+                    success = False
+                    reply = "无法识别音量"
             else:
                 reply = await ot_play_search(rest)
+        if action == "点歌":
+            success = not reply.startswith(("没找到", "还没选择", "音乐服务未连接",
+                                            "播放失败", "请说出", "输出音箱选择失败"))
+            if "播放列表未全部加入" in reply:
+                success = False
     except Exception as e:
         log.error("执行指令失败: %s", e)
-        reply = "出错了, 请稍后再试"
+        success = False
+        reply = f"执行失败: {e}"
 
+    record_command(query, True, action, reply, success)
     await mi_pause_speaker()
     await mi_tts(reply)
     return True
@@ -804,6 +868,12 @@ label {{ font-size: 14px; color: #555; }}
 .muted {{ color: #999; font-size: 13px; }}
 .warn {{ background: #fffbe6; border: 1px solid #ffe58f; border-radius: 8px;
   padding: 12px; margin-top: 12px; }}
+.history-scroll {{ overflow-x: auto; }}
+.history-table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+.history-table th, .history-table td {{ padding: 8px 6px; text-align: left;
+  border-bottom: 1px solid #eee; vertical-align: top; }}
+.history-table th:first-child {{ min-width: 130px; }}
+.history-table td {{ overflow-wrap: anywhere; }}
 </style></head><body>
 <h1>🎵 小爱 → AirPlay 桥接</h1>
 <div class="card">
@@ -839,6 +909,44 @@ label {{ font-size: 14px; color: #555; }}
   <input type="text" name="trigger" value="{trigger}">
   <button type="submit">保存</button>
 </form></div>
+<h2>指令历史</h2>
+<div class="card history-scroll">
+  <table class="history-table">
+    <thead><tr><th>时间</th><th>指令</th><th>动作</th><th>结果</th></tr></thead>
+    <tbody id="history-body"><tr><td colspan="4" class="muted">加载中...</td></tr></tbody>
+  </table>
+</div>
+<script>
+async function refreshHistory() {{
+  try {{
+    const response = await fetch('/api/history');
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const history = await response.json();
+    const body = document.getElementById('history-body');
+    body.replaceChildren();
+    if (!history.length) {{
+      const row = body.insertRow();
+      const cell = row.insertCell();
+      cell.colSpan = 4;
+      cell.className = 'muted';
+      cell.textContent = '暂无指令历史';
+      return;
+    }}
+    for (const entry of history) {{
+      const row = body.insertRow();
+      for (const value of [entry.time, entry.query, entry.action, entry.result]) {{
+        row.insertCell().textContent = value ?? '';
+      }}
+      if (entry.success === true) row.cells[3].className = 'ok';
+      if (entry.success === false) row.cells[3].className = 'err';
+    }}
+  }} catch (error) {{
+    console.error('加载指令历史失败', error);
+  }}
+}}
+refreshHistory();
+setInterval(refreshHistory, 5000);
+</script>
 </body></html>"""
 
 TFA_BLOCK = """<div class="warn">
@@ -907,6 +1015,11 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return render_page()
+
+
+@app.get("/api/history")
+async def history():
+    return JSONResponse(COMMAND_HISTORY)
 
 
 @app.post("/setup/mi")
