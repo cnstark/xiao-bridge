@@ -477,6 +477,9 @@ async def ot_play_search(query):
         return "还没选择输出音箱"
     if not await ot_check():
         return "音乐服务未连接"
+    artist_request = re.fullmatch(r"(.+?)的(?:歌曲|歌)", query.strip("，。,. "))
+    if artist_request:
+        return await ot_play_artist(artist_request.group(1).strip())
     # 首选: 曲库模糊匹配(容错语音识别误差)
     track = await ot_fuzzy_track(query)
     if track:
@@ -502,12 +505,35 @@ async def ot_play_search(query):
 TRACKS_CACHE = {"time": 0.0, "items": []}
 
 
-async def ot_play_track_with_library(track):
-    """先播放点播歌曲，再将曲库其余歌曲随机加入当前队列。"""
+async def ot_play_artist(artist_name):
+    """随机播放指定歌手的一首歌，并把该歌手的全部歌曲排入队列。"""
+    artist = _norm(artist_name)
+    if not artist:
+        return "请说出歌手名字"
+    tracks = await ot_library_tracks()
+    matches = []
+    seen = set()
+    for track in tracks:
+        uri = track.get("uri")
+        if (uri and uri not in seen
+                and artist in _artist_names(track.get("artist", ""))):
+            matches.append(track)
+            seen.add(uri)
+    if not matches:
+        return f"没找到歌手 {artist_name} 的歌曲"
+    random.shuffle(matches)
+    return await ot_play_track_with_library(
+        matches[0], tracks=matches,
+        reply=f"正在随机播放 {artist_name} 的歌曲，共 {len(matches)} 首")
+
+
+async def ot_play_track_with_library(track, tracks=None, reply=None):
+    """先播放指定歌曲，再将提供的曲目随机加入当前队列。"""
     selected_uri = track.get("uri")
     if not selected_uri:
         return "播放失败"
-    tracks = await ot_library_tracks()
+    if tracks is None:
+        tracks = await ot_library_tracks()
     remaining = []
     seen = {selected_uri}
     for item in tracks:
@@ -518,7 +544,7 @@ async def ot_play_track_with_library(track):
     random.shuffle(remaining)
     uris = [selected_uri, *remaining]
     title = track.get("title") or track.get("name") or ""
-    reply = f"正在播放 {track.get('artist', '')} {title}".strip()
+    reply = reply or f"正在播放 {track.get('artist', '')} {title}".strip()
 
     # OwnTone 的 uris 是逗号分隔的查询参数，分批避免超长 URL。
     for offset in range(0, len(uris), 50):
