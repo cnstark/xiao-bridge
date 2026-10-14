@@ -24,7 +24,7 @@ services:
       - /path/to/your/music:/music:ro
 
   xiaoair:
-    image: ghcr.io/cnstark/xiaoair:latest
+    image: cnstark/xiaoair:latest  # Docker Hub; 也可用 ghcr.io/cnstark/xiaoair:latest
     build: .
     container_name: xiaoair
     restart: unless-stopped
